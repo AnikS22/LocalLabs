@@ -11,13 +11,41 @@ import SwiftData
 /// Main chat interface view
 struct ChatView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
     @State private var viewModel = ChatViewModel()
-    @State private var voiceViewModel = VoiceViewModel()
     @State private var showingModelSelection = false
     @State private var showingDeviceSync = false
+    @State private var showingMenu = false
+
+    let initialConversation: Conversation?
+
+    init(conversation: Conversation? = nil) {
+        self.initialConversation = conversation
+    }
 
     var body: some View {
-        NavigationStack {
+        ZStack {
+            AppTheme.Colors.background
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                // Custom Navigation Bar
+                CustomNavigationBar(
+                title: viewModel.conversation?.title ?? "Chat",
+                onBack: {
+                    dismiss()
+                },
+                onModelSelect: {
+                    showingModelSelection = true
+                },
+                onSync: {
+                    showingDeviceSync = true
+                },
+                onMenu: {
+                    showingMenu = true
+                }
+            )
+
             VStack(spacing: 0) {
                 // Messages list
                 ScrollViewReader { proxy in
@@ -30,18 +58,18 @@ struct ChatView: View {
                                 }
                             } else {
                                 // Empty state
-                                VStack(spacing: 16) {
+                                VStack(spacing: AppTheme.Spacing.md) {
                                     Image(systemName: "bubble.left.and.bubble.right")
-                                        .font(.system(size: 60))
-                                        .foregroundColor(.secondary)
+                                        .font(.system(size: 40))
+                                        .foregroundColor(AppTheme.Colors.textTertiary)
                                     Text("No conversation yet")
-                                        .font(.title3)
-                                        .foregroundColor(.secondary)
+                                        .font(AppTheme.Typography.body())
+                                        .foregroundColor(AppTheme.Colors.textSecondary)
                                     Text("Start chatting with your local AI")
-                                        .font(.subheadline)
-                                        .foregroundColor(.secondary)
+                                        .font(AppTheme.Typography.caption())
+                                        .foregroundColor(AppTheme.Colors.textTertiary)
                                 }
-                                .padding(.top, 100)
+                                .padding(.top, 80)
                             }
 
                             // Streaming response indicator
@@ -94,188 +122,69 @@ struct ChatView: View {
                 Divider()
 
                 // Input area
-                VStack(spacing: 4) {
-                    // Recording indicator
-                    if voiceViewModel.isRecording {
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(Color.red)
-                                .frame(width: 8, height: 8)
-                                .opacity(0.8)
-                                .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: voiceViewModel.isRecording)
-
-                            Text(voiceViewModel.transcribedText.isEmpty ? "Listening..." : voiceViewModel.transcribedText)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-
-                            Spacer()
-
-                            Button("Cancel") {
-                                voiceViewModel.cancelRecording()
-                            }
-                            .font(.caption)
-                            .foregroundColor(.red)
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 4)
-                        .background(Color(.systemGray6))
-                    }
-
-                    HStack(spacing: 12) {
-                        // Microphone button
-                        Button(action: {
-                            Task {
-                                if voiceViewModel.isRecording {
-                                    let transcription = voiceViewModel.stopRecording()
-                                    if !transcription.isEmpty {
-                                        viewModel.userInput = transcription
-                                        viewModel.sendMessage()
-                                    }
-                                } else {
-                                    await voiceViewModel.startRecording()
-                                }
-                            }
-                        }) {
-                            Image(systemName: voiceViewModel.isRecording ? "mic.fill" : "mic")
-                                .font(.title2)
-                                .foregroundColor(voiceViewModel.isRecording ? .red : .blue)
-                        }
-                        .disabled(viewModel.isSending)
-
-                        TextField("Message", text: $viewModel.userInput, axis: .vertical)
-                            .textFieldStyle(.roundedBorder)
-                            .lineLimit(1...5)
-                            .disabled(viewModel.isSending || !viewModel.isReady || voiceViewModel.isRecording)
-                            .onSubmit {
-                                viewModel.sendMessage()
-                            }
-
-                        Button(action: {
+                HStack(spacing: 12) {
+                    TextField("Message", text: $viewModel.userInput, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                        .lineLimit(1...5)
+                        .disabled(viewModel.isSending || !viewModel.isReady)
+                        .tint(AppTheme.Colors.accent)
+                        .onSubmit {
                             viewModel.sendMessage()
-                        }) {
-                            Image(systemName: viewModel.isSending ? "stop.circle.fill" : "arrow.up.circle.fill")
-                                .font(.title2)
-                                .foregroundColor(canSend ? .blue : .gray)
-                        }
-                        .disabled(!canSend && !viewModel.isSending)
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                }
-                .background(Color(.systemBackground))
-            }
-            .navigationTitle(viewModel.conversation?.title ?? "Chat")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        showingModelSelection = true
-                    } label: {
-                        Label("Models", systemImage: "cube.box")
-                    }
-                }
-
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        showingDeviceSync = true
-                    } label: {
-                        Label("Sync", systemImage: "arrow.triangle.2.circlepath")
-                    }
-                }
-
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Menu {
-                        // TTS Toggle
-                        Toggle(isOn: $voiceViewModel.isTTSEnabled) {
-                            Label("Voice Responses", systemImage: voiceViewModel.isSpeaking ? "speaker.wave.3.fill" : "speaker.wave.2")
                         }
 
-                        Divider()
-
-                        Button {
-                            viewModel.startNewConversation()
-                        } label: {
-                            Label("New Chat", systemImage: "square.and.pencil")
-                        }
-
-                        if viewModel.conversation != nil {
-                            Divider()
-
-                            Button(role: .destructive) {
-                                viewModel.deleteCurrentConversation()
-                            } label: {
-                                Label("Delete Chat", systemImage: "trash")
-                            }
-                        }
-
-                        if let stats = viewModel.lastStats {
-                            Divider()
-
-                            Text("Last generation: \(String(format: "%.1f", stats.tokensPerSecond)) tok/s")
-                        }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
+                    Button(action: {
+                        viewModel.sendMessage()
+                    }) {
+                        Image(systemName: viewModel.isSending ? "stop.circle.fill" : "arrow.up.circle.fill")
+                            .font(.title2)
+                            .foregroundColor(canSend ? AppTheme.Colors.accent : AppTheme.Colors.textTertiary)
                     }
+                    .disabled(!canSend && !viewModel.isSending)
                 }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .background(AppTheme.Colors.background)
             }
-            .sheet(isPresented: $showingModelSelection) {
-                ModelSelectionView()
-            }
-            .sheet(isPresented: $showingDeviceSync) {
-                DeviceSyncView()
-            }
-            .alert("Error", isPresented: $viewModel.showError) {
-                Button("OK") {
-                    viewModel.showError = false
-                }
-            } message: {
-                if let errorMessage = viewModel.errorMessage {
-                    Text(errorMessage)
-                }
-            }
-            .alert("Microphone Permission Required", isPresented: $voiceViewModel.showPermissionAlert) {
-                Button("Settings") {
-                    if let url = URL(string: UIApplication.openSettingsURLString) {
-                        UIApplication.shared.open(url)
-                    }
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("LocalLabs needs microphone and speech recognition permissions for voice input. Please enable them in Settings.")
-            }
-            .alert("Voice Error", isPresented: $voiceViewModel.showError) {
-                Button("OK") {
-                    voiceViewModel.showError = false
-                }
-            } message: {
-                if let errorMessage = voiceViewModel.errorMessage {
-                    Text(errorMessage)
-                }
-            }
-            .onAppear {
-                // Start a new conversation if none exists
-                if viewModel.conversation == nil && viewModel.isReady {
+        }
+        }
+        .preferredColorScheme(.dark)
+        .sheet(isPresented: $showingModelSelection) {
+            ModelSelectionView()
+        }
+        .sheet(isPresented: $showingDeviceSync) {
+            DeviceSyncView()
+        }
+        .sheet(isPresented: $showingMenu) {
+            MenuSheet(
+                hasConversation: viewModel.conversation != nil,
+                stats: viewModel.lastStats,
+                onNewChat: {
+                    showingMenu = false
                     viewModel.startNewConversation()
+                },
+                onDeleteChat: {
+                    showingMenu = false
+                    viewModel.deleteCurrentConversation()
                 }
+            )
+            .presentationDetents([.height(250)])
+            .presentationDragIndicator(.visible)
+        }
+        .alert("Error", isPresented: $viewModel.showError) {
+            Button("OK") {
+                viewModel.showError = false
             }
-            .onChange(of: viewModel.streamingResponse) { oldValue, newValue in
-                // Speak AI responses if TTS enabled
-                if voiceViewModel.isTTSEnabled && !newValue.isEmpty && oldValue != newValue {
-                    // Only speak when response is complete (not streaming individual tokens)
-                    if !viewModel.isStreaming && !newValue.isEmpty {
-                        voiceViewModel.speak(newValue)
-                    }
-                }
+        } message: {
+            if let errorMessage = viewModel.errorMessage {
+                Text(errorMessage)
             }
-            .onChange(of: viewModel.conversation?.messages.last) { _, newMessage in
-                // Speak assistant messages when they're added
-                if let message = newMessage,
-                   message.role == .assistant,
-                   voiceViewModel.isTTSEnabled,
-                   !message.content.isEmpty {
-                    voiceViewModel.speak(message.content)
-                }
+        }
+        .onAppear {
+            // Load initial conversation if provided, otherwise start new
+            if let conversation = initialConversation {
+                viewModel.loadConversation(conversation)
+            } else if viewModel.conversation == nil && viewModel.isReady {
+                viewModel.startNewConversation()
             }
         }
     }

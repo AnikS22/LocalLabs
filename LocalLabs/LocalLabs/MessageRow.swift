@@ -45,16 +45,23 @@ struct MessageRow: View {
     private var backgroundColor: Color {
         switch message.role {
         case .user:
-            return .blue
+            return AppTheme.Colors.userMessageBackground
         case .assistant:
-            return Color(.systemGray5)
+            return AppTheme.Colors.assistantMessageBackground
         case .system:
             return .orange
         }
     }
 
     private var textColor: Color {
-        message.role == .user ? .white : .primary
+        switch message.role {
+        case .user:
+            return AppTheme.Colors.userMessageText
+        case .assistant:
+            return AppTheme.Colors.assistantMessageText
+        case .system:
+            return .white
+        }
     }
 
     private func formatTime(_ date: Date) -> String {

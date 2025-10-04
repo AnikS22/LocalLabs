@@ -26,7 +26,7 @@ struct LocalLabsApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ChatView()
+            HomeView()
         }
         .modelContainer(sharedModelContainer)
     }
