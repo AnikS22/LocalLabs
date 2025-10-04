@@ -41,8 +41,13 @@ class ChatViewModel {
         chatService.lastStats
     }
 
-    init(chatService: ChatService = .shared) {
+    init(chatService: ChatService) {
         self.chatService = chatService
+    }
+
+    /// Convenience initializer using shared service
+    init() {
+        self.chatService = ChatService.shared
     }
 
     /// Send the current user input as a message

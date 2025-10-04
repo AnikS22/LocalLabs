@@ -7,6 +7,7 @@
 
 import SwiftUI
 import SwiftData
+import MultipeerConnectivity
 
 /// View for device-to-device sync
 struct DeviceSyncView: View {

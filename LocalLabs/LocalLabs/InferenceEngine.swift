@@ -2,21 +2,22 @@
 //  InferenceEngine.swift
 //  LocalLabs
 //
-//  Created by LocalLabs Team
+//  MLX-based local inference engine for iPhone
 //
 
 import Foundation
 import MLX
 import MLXLLM
+import MLXLMCommon
 import MLXRandom
-import Tokenizers
+import Hub
 
-/// Manages MLX model inference with streaming support
+/// Manages MLX model inference with streaming support - fully local on iPhone
 @MainActor
 @Observable
 class InferenceEngine {
-    /// The currently loaded LLM model container
-    private var llmModel: LLMModel?
+    /// The currently loaded model container
+    private var modelContainer: ModelContainer?
 
     /// The model configuration being used
     private(set) var currentModelConfig: ModelConfig?
@@ -30,38 +31,45 @@ class InferenceEngine {
     /// Generation statistics
     private(set) var lastGenerationStats: GenerationStats?
 
-    /// Maximum tokens to generate
-    private let maxTokens: Int = 512
+    /// Maximum tokens to generate (configurable for different use cases)
+    var maxTokens: Int = 512
 
     /// Temperature for sampling (lower = more focused, higher = more creative)
-    private let temperature: Float = 0.7
+    var temperature: Float = 0.7
 
-    /// Top-p sampling parameter
-    private let topP: Float = 0.9
+    /// Top-p sampling parameter (nucleus sampling threshold)
+    var topP: Float = 0.9
 
     init() {}
 
-    /// Load a model from disk
+    /// Load a model from local disk (for local iPhone inference)
     /// - Parameters:
-    ///   - modelPath: URL to the model directory
+    ///   - modelPath: URL to the model directory on device
     ///   - config: Model configuration
     func loadModel(from modelPath: URL, config: ModelConfig) async throws {
-        print("🔄 Loading model: \(config.displayName)")
+        print("🔄 Loading model locally: \(config.displayName)")
         print("📂 Model path: \(modelPath.path)")
 
         do {
             // Unload any existing model first
             unloadModel()
 
-            // Load the model using MLXLLM
-            // The LLMModel.load() method expects a path to a directory containing:
-            // - config.json
-            // - weights.safetensors (or model.safetensors)
-            // - tokenizer.json
-            let modelConfiguration = ModelConfiguration.directory(modelPath)
+            // Set GPU cache limit dynamically based on available memory
+            let cacheLimit = calculateOptimalGPUCache()
+            MLX.GPU.set(cacheLimit: cacheLimit)
+            print("🎮 GPU cache limit set to: \(cacheLimit / 1024 / 1024)MB")
 
-            // Load the model with Metal GPU acceleration
-            llmModel = try await LLMModel.load(hub: modelConfiguration)
+            // Create ModelConfiguration pointing to local directory
+            let modelConfiguration = ModelConfiguration(
+                directory: modelPath
+            )
+
+            // Load the model container
+            modelContainer = try await LLMModelFactory.shared.loadContainer(
+                configuration: modelConfiguration
+            ) { progress in
+                print("📥 Loading progress: \(Int(progress.fractionCompleted * 100))%")
+            }
 
             currentModelConfig = config
             isModelLoaded = true
@@ -72,7 +80,7 @@ class InferenceEngine {
         } catch {
             isModelLoaded = false
             currentModelConfig = nil
-            llmModel = nil
+            modelContainer = nil
             print("❌ Failed to load model: \(error.localizedDescription)")
             throw InferenceError.modelLoadFailed(error.localizedDescription)
         }
@@ -80,22 +88,22 @@ class InferenceEngine {
 
     /// Unload the current model to free memory
     func unloadModel() {
-        llmModel = nil
+        modelContainer = nil
         currentModelConfig = nil
         isModelLoaded = false
         print("🗑️ Model unloaded")
     }
 
-    /// Generate a response to a prompt with streaming
+    /// Generate a response with conversation history - all local on iPhone
     /// - Parameters:
-    ///   - prompt: The input prompt
+    ///   - messages: The conversation history
     ///   - onToken: Callback for each generated token
     /// - Returns: The complete generated text
-    func generate(
-        prompt: String,
-        onToken: @escaping (String) -> Void
+    func generateWithHistory(
+        messages: [Message],
+        onToken: @escaping @Sendable (String) -> Void
     ) async throws -> String {
-        guard let model = llmModel else {
+        guard let container = modelContainer else {
             throw InferenceError.modelNotLoaded
         }
 
@@ -110,44 +118,90 @@ class InferenceEngine {
         let startTime = Date()
 
         do {
-            // Prepare the prompt with chat template
-            let formattedPrompt = formatPrompt(prompt)
+            // Convert messages to Chat.Message format
+            var chatMessages: [Chat.Message] = [
+                .system("You are a helpful AI assistant running locally on an iPhone.")
+            ]
 
-            // Create generation parameters
-            let generateParameters = GenerateParameters(
-                temperature: temperature,
-                topP: topP
-            )
-
-            // Generate with streaming
-            var tokenCount = 0
-            let stream = try await model.generate(
-                prompt: formattedPrompt,
-                parameters: generateParameters,
-                maxTokens: maxTokens
-            )
-
-            for try await token in stream {
-                fullResponse += token.text
-                tokenCount += 1
-                onToken(token.text)
-
-                // Check for context overflow
-                if tokenCount >= maxTokens {
-                    print("⚠️ Max tokens reached: \(maxTokens)")
-                    break
+            for message in messages {
+                if message.role == .user {
+                    chatMessages.append(.user(message.content))
+                } else if message.role == .assistant {
+                    chatMessages.append(.assistant(message.content))
                 }
             }
 
-            // Calculate statistics
-            let duration = Date().timeIntervalSince(startTime)
-            lastGenerationStats = GenerationStats(
-                tokensGenerated: tokenCount,
-                timeElapsed: duration,
-                tokensPerSecond: Double(tokenCount) / duration
-            )
+            // Prepare the user input with chat format
+            let userInput = UserInput(chat: chatMessages)
 
-            print("📊 Generation stats: \(tokenCount) tokens in \(String(format: "%.2f", duration))s (\(String(format: "%.1f", lastGenerationStats!.tokensPerSecond)) tok/s)")
+            // Random seed for generation variety
+            MLXRandom.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
+
+            // Capture generation parameters before entering perform closure
+            let tempValue = self.temperature
+            let topPValue = self.topP
+            let maxTokensValue = self.maxTokens
+
+            var tokenCount = 0
+
+            // Use perform to access the model context
+            try await container.perform { (context: ModelContext) -> Void in
+                // Prepare the input
+                let lmInput = try await context.processor.prepare(input: userInput)
+
+                // Generate with parameters
+                let generateParams = GenerateParameters(
+                    temperature: tempValue,
+                    topP: topPValue
+                )
+
+                // Create the generation stream
+                let stream = try MLXLMCommon.generate(
+                    input: lmInput,
+                    parameters: generateParams,
+                    context: context
+                )
+
+                // Process the stream
+                for try await generation in stream {
+                    if let chunk = generation.chunk {
+                        fullResponse += chunk
+                        tokenCount += 1
+
+                        // Call the token callback
+                        onToken(chunk)
+                    }
+
+                    // Update stats if available
+                    if let info = generation.info {
+                        Task { @MainActor in
+                            self.lastGenerationStats = GenerationStats(
+                                tokensGenerated: tokenCount,
+                                timeElapsed: Date().timeIntervalSince(startTime),
+                                tokensPerSecond: info.tokensPerSecond
+                            )
+                        }
+                    }
+
+                    // Check for max tokens
+                    if tokenCount >= maxTokensValue {
+                        print("⚠️ Max tokens reached: \(maxTokensValue)")
+                        break
+                    }
+                }
+            }
+
+            // Calculate final statistics
+            let duration = Date().timeIntervalSince(startTime)
+            if lastGenerationStats == nil {
+                lastGenerationStats = GenerationStats(
+                    tokensGenerated: tokenCount,
+                    timeElapsed: duration,
+                    tokensPerSecond: Double(tokenCount) / duration
+                )
+            }
+
+            print("📊 Generation complete: \(tokenCount) tokens in \(String(format: "%.2f", duration))s (\(String(format: "%.1f", lastGenerationStats!.tokensPerSecond)) tok/s)")
 
             return fullResponse
 
@@ -157,65 +211,145 @@ class InferenceEngine {
         }
     }
 
-    /// Format a user prompt with the appropriate chat template
-    /// - Parameter userMessage: The user's message
-    /// - Returns: Formatted prompt ready for the model
-    private func formatPrompt(_ userMessage: String) -> String {
-        // For Llama models, use the chat template format
-        // Different models may require different templates
-        guard let config = currentModelConfig else {
-            return userMessage
+    /// Generate a response to a prompt with streaming - all local on iPhone
+    /// - Parameters:
+    ///   - prompt: The input prompt
+    ///   - onToken: Callback for each generated token
+    /// - Returns: The complete generated text
+    func generate(
+        prompt: String,
+        onToken: @escaping @Sendable (String) -> Void
+    ) async throws -> String {
+        guard let container = modelContainer else {
+            throw InferenceError.modelNotLoaded
         }
 
-        if config.id.contains("llama") {
-            // Llama 3.2 chat template
-            return """
-            <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-            You are a helpful AI assistant running locally on an iPhone.<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-            \(userMessage)<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-
-            """
-        } else if config.id.contains("phi") {
-            // Phi-3 chat template
-            return "<|system|>\nYou are a helpful AI assistant.<|end|>\n<|user|>\n\(userMessage)<|end|>\n<|assistant|>\n"
-        } else if config.id.contains("qwen") {
-            // Qwen chat template
-            return "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n\(userMessage)<|im_end|>\n<|im_start|>assistant\n"
+        guard !isGenerating else {
+            throw InferenceError.alreadyGenerating
         }
 
-        // Fallback for unknown models
-        return userMessage
-    }
+        isGenerating = true
+        defer { isGenerating = false }
 
-    /// Format a conversation history into a prompt
-    /// - Parameter messages: Array of messages in the conversation
-    /// - Returns: Formatted prompt with full conversation
-    func formatConversationPrompt(_ messages: [Message]) -> String {
-        guard let config = currentModelConfig else {
-            return messages.last?.content ?? ""
-        }
+        var fullResponse = ""
+        let startTime = Date()
 
-        if config.id.contains("llama") {
-            var prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-            prompt += "You are a helpful AI assistant running locally on an iPhone.<|eot_id|>"
+        do {
+            // Prepare the user input with chat format
+            let userInput = UserInput(
+                chat: [
+                    .system("You are a helpful AI assistant running locally on an iPhone."),
+                    .user(prompt)
+                ]
+            )
 
-            for message in messages {
-                if message.role == .user {
-                    prompt += "<|start_header_id|>user<|end_header_id|>\n\n\(message.content)<|eot_id|>"
-                } else if message.role == .assistant {
-                    prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n\(message.content)<|eot_id|>"
+            // Random seed for generation variety
+            MLXRandom.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
+
+            // Capture generation parameters before entering perform closure
+            let tempValue = self.temperature
+            let topPValue = self.topP
+            let maxTokensValue = self.maxTokens
+
+            var tokenCount = 0
+
+            // Use perform to access the model context
+            try await container.perform { (context: ModelContext) -> Void in
+                // Prepare the input
+                let lmInput = try await context.processor.prepare(input: userInput)
+
+                // Generate with parameters
+                let generateParams = GenerateParameters(
+                    temperature: tempValue,
+                    topP: topPValue
+                )
+
+                // Create the generation stream
+                let stream = try MLXLMCommon.generate(
+                    input: lmInput,
+                    parameters: generateParams,
+                    context: context
+                )
+
+                // Process the stream
+                for try await generation in stream {
+                    if let chunk = generation.chunk {
+                        fullResponse += chunk
+                        tokenCount += 1
+
+                        // Call the token callback
+                        Task { @MainActor in
+                            onToken(chunk)
+                        }
+                    }
+
+                    // Update stats if available
+                    if let info = generation.info {
+                        Task { @MainActor in
+                            self.lastGenerationStats = GenerationStats(
+                                tokensGenerated: tokenCount,
+                                timeElapsed: Date().timeIntervalSince(startTime),
+                                tokensPerSecond: info.tokensPerSecond
+                            )
+                        }
+                    }
+
+                    // Check for max tokens
+                    if tokenCount >= maxTokensValue {
+                        print("⚠️ Max tokens reached: \(maxTokensValue)")
+                        break
+                    }
                 }
             }
 
-            prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
-            return prompt
+            // Calculate final statistics
+            let duration = Date().timeIntervalSince(startTime)
+            if lastGenerationStats == nil {
+                lastGenerationStats = GenerationStats(
+                    tokensGenerated: tokenCount,
+                    timeElapsed: duration,
+                    tokensPerSecond: Double(tokenCount) / duration
+                )
+            }
+
+            print("📊 Generation complete: \(tokenCount) tokens in \(String(format: "%.2f", duration))s (\(String(format: "%.1f", lastGenerationStats!.tokensPerSecond)) tok/s)")
+
+            return fullResponse
+
+        } catch {
+            print("❌ Generation failed: \(error.localizedDescription)")
+            throw InferenceError.generationFailed(error.localizedDescription)
+        }
+    }
+
+    /// Calculate optimal GPU cache limit based on device memory
+    /// - Returns: Cache limit in bytes
+    private func calculateOptimalGPUCache() -> Int {
+        // Get physical memory of the device
+        var size: UInt64 = 0
+        var sizeLen = MemoryLayout<UInt64>.size
+        sysctlbyname("hw.memsize", &size, &sizeLen, nil, 0)
+
+        let totalMemoryMB = Int(size / 1024 / 1024)
+
+        // Allocate GPU cache based on total device memory
+        // Conservative approach: use ~10-15% of total memory for GPU cache
+        let cacheSizeMB: Int
+        if totalMemoryMB >= 6000 {
+            // 6GB+ devices (iPhone 13 Pro and newer): use 1GB cache
+            cacheSizeMB = 1024
+        } else if totalMemoryMB >= 4000 {
+            // 4GB+ devices (iPhone 12 and newer): use 512MB cache
+            cacheSizeMB = 512
+        } else if totalMemoryMB >= 3000 {
+            // 3GB+ devices (iPhone XS and newer): use 256MB cache
+            cacheSizeMB = 256
+        } else {
+            // Older devices: use conservative 128MB cache
+            cacheSizeMB = 128
         }
 
-        // Fallback: just return the last user message
-        return messages.last?.content ?? ""
+        return cacheSizeMB * 1024 * 1024
     }
 
     /// Check available memory and warn if low

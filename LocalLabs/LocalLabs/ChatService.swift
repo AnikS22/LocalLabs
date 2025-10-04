@@ -123,7 +123,6 @@ class ChatService {
 
         // Create user message
         let userMsg = Message(content: userMessage, role: .user)
-        userMsg.conversation = conversation
         conversation.messages.append(userMsg)
         modelContext?.insert(userMsg)
 
@@ -133,20 +132,16 @@ class ChatService {
         // Manage context window - keep only recent messages if context is too long
         let managedMessages = manageContextWindow(messages: allMessages)
 
-        // Format prompt with conversation history
-        let prompt = inferenceEngine.formatConversationPrompt(managedMessages)
-
         // Create assistant message placeholder
         let assistantMsg = Message(content: "", role: .assistant)
-        assistantMsg.conversation = conversation
         conversation.messages.append(assistantMsg)
         modelContext?.insert(assistantMsg)
 
         var accumulatedResponse = ""
 
-        // Generate response with streaming
+        // Generate response with streaming using conversation history
         do {
-            let response = try await inferenceEngine.generate(prompt: prompt) { token in
+            let response = try await inferenceEngine.generateWithHistory(messages: managedMessages) { token in
                 accumulatedResponse += token
                 assistantMsg.content = accumulatedResponse
                 onToken(token)
@@ -189,18 +184,25 @@ class ChatService {
             return messages
         }
 
-        // Rough estimation: average 4 characters per token
-        let maxChars = modelConfig.contextLength * 3 // Leave room for response
+        // More accurate token estimation: ~3.5 characters per token for English text
+        let charsPerToken = 3.5
+
+        // Reserve space for response (use inferenceEngine's maxTokens setting)
+        let responseTokens = inferenceEngine.maxTokens
+        let inputTokenLimit = modelConfig.contextLength - responseTokens
+        let maxChars = Int(Double(inputTokenLimit) * charsPerToken)
 
         var totalChars = 0
         var managedMessages: [Message] = []
 
         // Add messages from most recent to oldest until we hit the limit
         for message in messages.reversed() {
-            totalChars += message.content.count
-            if totalChars > maxChars {
+            let messageChars = message.content.count
+            if totalChars + messageChars > maxChars && !managedMessages.isEmpty {
+                // Would exceed limit, stop here
                 break
             }
+            totalChars += messageChars
             managedMessages.insert(message, at: 0)
         }
 
@@ -210,7 +212,8 @@ class ChatService {
         }
 
         if managedMessages.count < messages.count {
-            print("⚠️ Context trimmed: Using \(managedMessages.count)/\(messages.count) messages")
+            let estimatedTokens = Int(Double(totalChars) / charsPerToken)
+            print("⚠️ Context trimmed: Using \(managedMessages.count)/\(messages.count) messages (~\(estimatedTokens)/\(inputTokenLimit) tokens)")
         }
 
         return managedMessages
